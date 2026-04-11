@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -32,6 +33,19 @@ type RawSnapshot struct {
 	WriteIOsTotal     uint64    `json:"write_ios_total"`
 	RXBytesTotal      uint64    `json:"rx_bytes_total"`
 	TXBytesTotal      uint64    `json:"tx_bytes_total"`
+}
+
+func (r RawSnapshot) Validate() error {
+	if r.Timestamp.IsZero() {
+		return errors.New("zero timestamp")
+	}
+	if r.Host == "" {
+		return errors.New("empty host")
+	}
+	if r.MemTotalBytes == 0 && r.SwapTotalBytes == 0 {
+		return errors.New("both mem and swap total are zero")
+	}
+	return nil
 }
 
 type DerivedSnapshot struct {
@@ -65,6 +79,13 @@ type DerivedSnapshot struct {
 	TXRateBPS       float64   `json:"tx_rate_Bps"`
 }
 
+func (d DerivedSnapshot) CPUUsageText() string {
+	if d.CPUUsagePercent == nil {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.2f%%", *d.CPUUsagePercent)
+}
+
 type Config struct {
 	Interval float64
 	Count    int
@@ -72,6 +93,147 @@ type Config struct {
 	JSON     bool
 	CSVPath  string
 	WarmupMS int
+}
+
+type CSVWriter struct {
+	mu sync.Mutex
+	path string
+	file *os.File
+	writer *csv.Writer
+}
+
+func NewCSVWriter(path string) (*CSVWriter, error) {
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+
+	needsHeader := false
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			needsHeader = true
+		} else {
+			return nil, err
+		}
+	} else if info.Size() == 0 {
+		needsHeader = true
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	w := csv.NewWriter(f)
+
+	if needsHeader {
+		err = w.Write([]string{
+			"timestamp_unix",
+			"timestamp_iso",
+			"host",
+			"elapsed_seconds",
+			"cpu_usage_percent",
+			"load1",
+			"load5",
+			"load15",
+			"mem_total_bytes",
+			"mem_available_bytes",
+			"mem_used_bytes",
+			"mem_used_percent",
+			"swap_total_bytes",
+			"swap_free_bytes",
+			"swap_used_bytes",
+			"swap_used_percent",
+			"pswpin_total",
+			"pswpout_total",
+			"swapin_rate_per_s",
+			"swapout_rate_per_s",
+			"read_ios_total",
+			"write_ios_total",
+			"read_iops",
+			"write_iops",
+			"rx_bytes_total",
+			"tx_bytes_total",
+			"rx_rate_Bps",
+			"tx_rate_Bps",
+		})
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		w.Flush()
+		if err := w.Error(); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+
+	return &CSVWriter{
+		path: path,
+		file: f,
+		writer: w,
+	}, nil
+}
+
+func (cw *CSVWriter) Append(d DerivedSnapshot) error {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+
+	cpu := ""
+	if d.CPUUsagePercent != nil {
+		cpu = fmt.Sprintf("%.6f", *d.CPUUsagePercent)
+	}
+
+	err := cw.writer.Write([]string{
+		strconv.FormatInt(d.TimestampUnix, 10),
+		d.Timestamp.Format(time.RFC3339),
+		d.Host,
+		fmt.Sprintf("%.6f", d.ElapsedSeconds),
+		cpu,
+		fmt.Sprintf("%.6f", d.Load1),
+		fmt.Sprintf("%.6f", d.Load5),
+		fmt.Sprintf("%.6f", d.Load15),
+		strconv.FormatUint(d.MemTotalBytes, 10),
+		strconv.FormatUint(d.MemAvailable, 10),
+		strconv.FormatUint(d.MemUsedBytes, 10),
+		fmt.Sprintf("%.6f", d.MemUsedPercent),
+		strconv.FormatUint(d.SwapTotalBytes, 10),
+		strconv.FormatUint(d.SwapFreeBytes, 10),
+		strconv.FormatUint(d.SwapUsedBytes, 10),
+		fmt.Sprintf("%.6f", d.SwapUsedPercent),
+		strconv.FormatUint(d.PSwpInTotal, 10),
+		strconv.FormatUint(d.PSwpOutTotal, 10),
+		fmt.Sprintf("%.6f", d.SwapInRate),
+		fmt.Sprintf("%.6f", d.SwapOutRate),
+		strconv.FormatUint(d.ReadIOsTotal, 10),
+		strconv.FormatUint(d.WriteIOsTotal, 10),
+		fmt.Sprintf("%.6f", d.ReadIOPS),
+		fmt.Sprintf("%.6f", d.WriteIOPS),
+		strconv.FormatUint(d.RXBytesTotal, 10),
+		strconv.FormatUint(d.TXBytesTotal, 10),
+		fmt.Sprintf("%.6f", d.RXRateBPS),
+		fmt.Sprintf("%.6f", d.TXRateBPS),
+	})
+	if err != nil {
+		return err
+	}
+	cw.writer.Flush()
+	return cw.writer.Error()
+}
+
+func (cw *CSVWriter) Close() error {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if cw.writer != nil {
+		cw.writer.Flush()
+	}
+	if cw.file != nil {
+		return cw.file.Close()
+	}
+	return nil
 }
 
 type Collector struct {
@@ -117,7 +279,7 @@ func (c *Collector) Collect() (RawSnapshot, error) {
 		return RawSnapshot{}, err
 	}
 
-	return RawSnapshot{
+	snapshot := RawSnapshot{
 		Timestamp:         time.Now(),
 		Host:              c.Hostname,
 		Load1:             load1,
@@ -135,7 +297,13 @@ func (c *Collector) Collect() (RawSnapshot, error) {
 		WriteIOsTotal:     writeIOs,
 		RXBytesTotal:      rxBytes,
 		TXBytesTotal:      txBytes,
-	}, nil
+	}
+
+	if err := snapshot.Validate(); err != nil {
+		return RawSnapshot{}, fmt.Errorf("invalid snapshot: %w", err)
+	}
+
+	return snapshot, nil
 }
 
 func (c *Collector) readLoad() (float64, float64, float64, error) {
@@ -209,6 +377,19 @@ func (c *Collector) readVMStat() (uint64, uint64, error) {
 	return in, out, nil
 }
 
+const (
+	cpuFieldUser = iota
+	cpuFieldNice
+	cpuFieldSystem
+	cpuFieldIdle
+	cpuFieldIowait
+	cpuFieldIrq
+	cpuFieldSoftirq
+	cpuFieldSteal
+	cpuFieldGuest
+	cpuFieldGuestNice
+)
+
 func (c *Collector) readCPU() (uint64, uint64, error) {
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
@@ -234,9 +415,16 @@ func (c *Collector) readCPU() (uint64, uint64, error) {
 			return 0, 0, errors.New("invalid cpu values")
 		}
 		total += v
-		if i == 3 || i == 4 {
+		if i == cpuFieldIdle {
 			idle += v
 		}
+		if i == cpuFieldIowait {
+			idle += v
+		}
+	}
+
+	if total == 0 {
+		return 0, 0, errors.New("cpu total is zero")
 	}
 
 	return idle, total, nil
@@ -307,9 +495,7 @@ func (c *Collector) readNetDev() (uint64, uint64, error) {
 	return rx, tx, nil
 }
 
-type DeltaCalculator struct{}
-
-func (d DeltaCalculator) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnapshot {
+func (c *Collector) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnapshot {
 	memUsed := clampSub(curr.MemTotalBytes, curr.MemAvailableBytes)
 	swapUsed := clampSub(curr.SwapTotalBytes, curr.SwapFreeBytes)
 
@@ -337,6 +523,10 @@ func (d DeltaCalculator) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnap
 	}
 
 	if prev == nil {
+		return out
+	}
+
+	if prev.Host != curr.Host {
 		return out
 	}
 
@@ -405,126 +595,6 @@ func sleepInterruptible(d time.Duration, stop <-chan struct{}) bool {
 	case <-stop:
 		return false
 	}
-}
-
-func ensureCSV(path string) error {
-	dir := filepath.Dir(path)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-
-	needsHeader := false
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			needsHeader = true
-		} else {
-			return err
-		}
-	} else if info.Size() == 0 {
-		needsHeader = true
-	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if needsHeader {
-		w := csv.NewWriter(f)
-		err = w.Write([]string{
-			"timestamp_unix",
-			"timestamp_iso",
-			"host",
-			"elapsed_seconds",
-			"cpu_usage_percent",
-			"load1",
-			"load5",
-			"load15",
-			"mem_total_bytes",
-			"mem_available_bytes",
-			"mem_used_bytes",
-			"mem_used_percent",
-			"swap_total_bytes",
-			"swap_free_bytes",
-			"swap_used_bytes",
-			"swap_used_percent",
-			"pswpin_total",
-			"pswpout_total",
-			"swapin_rate_per_s",
-			"swapout_rate_per_s",
-			"read_ios_total",
-			"write_ios_total",
-			"read_iops",
-			"write_iops",
-			"rx_bytes_total",
-			"tx_bytes_total",
-			"rx_rate_Bps",
-			"tx_rate_Bps",
-		})
-		if err != nil {
-			return err
-		}
-		w.Flush()
-		if err := w.Error(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func appendCSV(path string, d DerivedSnapshot) error {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	cpu := ""
-	if d.CPUUsagePercent != nil {
-		cpu = fmt.Sprintf("%.6f", *d.CPUUsagePercent)
-	}
-
-	w := csv.NewWriter(f)
-	err = w.Write([]string{
-		strconv.FormatInt(d.TimestampUnix, 10),
-		d.Timestamp.Format(time.RFC3339),
-		d.Host,
-		fmt.Sprintf("%.6f", d.ElapsedSeconds),
-		cpu,
-		fmt.Sprintf("%.6f", d.Load1),
-		fmt.Sprintf("%.6f", d.Load5),
-		fmt.Sprintf("%.6f", d.Load15),
-		strconv.FormatUint(d.MemTotalBytes, 10),
-		strconv.FormatUint(d.MemAvailable, 10),
-		strconv.FormatUint(d.MemUsedBytes, 10),
-		fmt.Sprintf("%.6f", d.MemUsedPercent),
-		strconv.FormatUint(d.SwapTotalBytes, 10),
-		strconv.FormatUint(d.SwapFreeBytes, 10),
-		strconv.FormatUint(d.SwapUsedBytes, 10),
-		fmt.Sprintf("%.6f", d.SwapUsedPercent),
-		strconv.FormatUint(d.PSwpInTotal, 10),
-		strconv.FormatUint(d.PSwpOutTotal, 10),
-		fmt.Sprintf("%.6f", d.SwapInRate),
-		fmt.Sprintf("%.6f", d.SwapOutRate),
-		strconv.FormatUint(d.ReadIOsTotal, 10),
-		strconv.FormatUint(d.WriteIOsTotal, 10),
-		fmt.Sprintf("%.6f", d.ReadIOPS),
-		fmt.Sprintf("%.6f", d.WriteIOPS),
-		strconv.FormatUint(d.RXBytesTotal, 10),
-		strconv.FormatUint(d.TXBytesTotal, 10),
-		fmt.Sprintf("%.6f", d.RXRateBPS),
-		fmt.Sprintf("%.6f", d.TXRateBPS),
-	})
-	if err != nil {
-		return err
-	}
-	w.Flush()
-	return w.Error()
 }
 
 func usage() string {
@@ -621,10 +691,7 @@ func output(d DerivedSnapshot, framed bool, jsonMode bool) error {
 }
 
 func formatLine(d DerivedSnapshot) string {
-	cpu := "N/A"
-	if d.CPUUsagePercent != nil {
-		cpu = fmt.Sprintf("%.2f%%", *d.CPUUsagePercent)
-	}
+	cpu := d.CPUUsageText()
 	return fmt.Sprintf(
 		"%d %s elapsed=%.3fs cpu=%s load=%.2f/%.2f/%.2f mem=%.1f%% swap=%.1f%% swap_delta=%.2f/%.2f disk_delta=%.2f/%.2f net_delta=%.2f/%.2f",
 		d.TimestampUnix,
@@ -648,7 +715,7 @@ func formatLine(d DerivedSnapshot) string {
 func printFramed(d DerivedSnapshot) {
 	lines := []string{
 		fmt.Sprintf("PERF-CHECK DELTA  host=%s  ts=%d  elapsed=%.3fs", d.Host, d.TimestampUnix, d.ElapsedSeconds),
-		fmt.Sprintf("CPU  usage=%s    LOAD  %.2f/%.2f/%.2f", cpuText(d.CPUUsagePercent), d.Load1, d.Load5, d.Load15),
+		fmt.Sprintf("CPU  usage=%s    LOAD  %.2f/%.2f/%.2f", d.CPUUsageText(), d.Load1, d.Load5, d.Load15),
 		fmt.Sprintf("MEM  used=%s (%.1f%%)    available=%s    total=%s", fmtBytes(d.MemUsedBytes), d.MemUsedPercent, fmtBytes(d.MemAvailable), fmtBytes(d.MemTotalBytes)),
 		fmt.Sprintf("SWAP used=%s (%.1f%%)    free=%s    total=%s", fmtBytes(d.SwapUsedBytes), d.SwapUsedPercent, fmtBytes(d.SwapFreeBytes), fmtBytes(d.SwapTotalBytes)),
 		fmt.Sprintf("SWAP Δ in=%s    out=%s    totals=%d/%d", fmtOps(d.SwapInRate), fmtOps(d.SwapOutRate), d.PSwpInTotal, d.PSwpOutTotal),
@@ -671,13 +738,6 @@ func printFramed(d DerivedSnapshot) {
 		}
 	}
 	fmt.Println("└" + strings.Repeat("─", width-2) + "┘")
-}
-
-func cpuText(v *float64) string {
-	if v == nil {
-		return "N/A"
-	}
-	return fmt.Sprintf("%.2f%%", *v)
 }
 
 func fmtBytes(value uint64) string {
@@ -729,15 +789,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	var csvWriter *CSVWriter
 	if cfg.CSVPath != "" {
-		if err := ensureCSV(cfg.CSVPath); err != nil {
+		csvWriter, err = NewCSVWriter(cfg.CSVPath)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		defer csvWriter.Close()
 	}
 
 	collector := NewCollector()
-	calc := DeltaCalculator{}
 
 	stop := make(chan struct{})
 	sig := make(chan os.Signal, 1)
@@ -765,13 +827,13 @@ func main() {
 			os.Exit(1)
 		}
 
-		derived := calc.Derive(&first, second)
+		derived := collector.Derive(&first, second)
 		if err := output(derived, cfg.Framed, cfg.JSON); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		if cfg.CSVPath != "" {
-			if err := appendCSV(cfg.CSVPath, derived); err != nil {
+		if csvWriter != nil {
+			if err := csvWriter.Append(derived); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
@@ -795,13 +857,13 @@ func main() {
 			os.Exit(1)
 		}
 
-		derived := calc.Derive(prev, curr)
+		derived := collector.Derive(prev, curr)
 		if err := output(derived, cfg.Framed, cfg.JSON); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		if cfg.CSVPath != "" {
-			if err := appendCSV(cfg.CSVPath, derived); err != nil {
+		if csvWriter != nil {
+			if err := csvWriter.Append(derived); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
