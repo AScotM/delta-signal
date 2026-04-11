@@ -35,33 +35,43 @@ type RawSnapshot struct {
 }
 
 type DerivedSnapshot struct {
-	Timestamp        time.Time `json:"timestamp"`
-	Host             string    `json:"host"`
-	ElapsedSeconds   float64   `json:"elapsed_seconds"`
-	Load1            float64   `json:"load1"`
-	Load5            float64   `json:"load5"`
-	Load15           float64   `json:"load15"`
-	MemTotalBytes    uint64    `json:"mem_total_bytes"`
-	MemAvailable     uint64    `json:"mem_available_bytes"`
-	MemUsedBytes     uint64    `json:"mem_used_bytes"`
-	MemUsedPercent   float64   `json:"mem_used_percent"`
-	SwapTotalBytes   uint64    `json:"swap_total_bytes"`
-	SwapFreeBytes    uint64    `json:"swap_free_bytes"`
-	SwapUsedBytes    uint64    `json:"swap_used_bytes"`
-	SwapUsedPercent  float64   `json:"swap_used_percent"`
-	PSwpInTotal      uint64    `json:"pswpin_total"`
-	PSwpOutTotal     uint64    `json:"pswpout_total"`
-	SwapInRate       float64   `json:"swapin_rate_per_s"`
-	SwapOutRate      float64   `json:"swapout_rate_per_s"`
-	CPUUsagePercent  *float64  `json:"cpu_usage_percent"`
-	ReadIOsTotal     uint64    `json:"read_ios_total"`
-	WriteIOsTotal    uint64    `json:"write_ios_total"`
-	ReadIOPS         float64   `json:"read_iops"`
-	WriteIOPS        float64   `json:"write_iops"`
-	RXBytesTotal     uint64    `json:"rx_bytes_total"`
-	TXBytesTotal     uint64    `json:"tx_bytes_total"`
-	RXRateBPS        float64   `json:"rx_rate_Bps"`
-	TXRateBPS        float64   `json:"tx_rate_Bps"`
+	Timestamp       time.Time `json:"timestamp"`
+	TimestampUnix   int64     `json:"timestamp_unix"`
+	Host            string    `json:"host"`
+	ElapsedSeconds  float64   `json:"elapsed_seconds"`
+	Load1           float64   `json:"load1"`
+	Load5           float64   `json:"load5"`
+	Load15          float64   `json:"load15"`
+	MemTotalBytes   uint64    `json:"mem_total_bytes"`
+	MemAvailable    uint64    `json:"mem_available_bytes"`
+	MemUsedBytes    uint64    `json:"mem_used_bytes"`
+	MemUsedPercent  float64   `json:"mem_used_percent"`
+	SwapTotalBytes  uint64    `json:"swap_total_bytes"`
+	SwapFreeBytes   uint64    `json:"swap_free_bytes"`
+	SwapUsedBytes   uint64    `json:"swap_used_bytes"`
+	SwapUsedPercent float64   `json:"swap_used_percent"`
+	PSwpInTotal     uint64    `json:"pswpin_total"`
+	PSwpOutTotal    uint64    `json:"pswpout_total"`
+	SwapInRate      float64   `json:"swapin_rate_per_s"`
+	SwapOutRate     float64   `json:"swapout_rate_per_s"`
+	CPUUsagePercent *float64  `json:"cpu_usage_percent"`
+	ReadIOsTotal    uint64    `json:"read_ios_total"`
+	WriteIOsTotal   uint64    `json:"write_ios_total"`
+	ReadIOPS        float64   `json:"read_iops"`
+	WriteIOPS       float64   `json:"write_iops"`
+	RXBytesTotal    uint64    `json:"rx_bytes_total"`
+	TXBytesTotal    uint64    `json:"tx_bytes_total"`
+	RXRateBPS       float64   `json:"rx_rate_Bps"`
+	TXRateBPS       float64   `json:"tx_rate_Bps"`
+}
+
+type Config struct {
+	Interval float64
+	Count    int
+	Framed   bool
+	JSON     bool
+	CSVPath  string
+	WarmupMS int
 }
 
 type Collector struct {
@@ -191,8 +201,7 @@ func (c *Collector) readVMStat() (uint64, uint64, error) {
 		}
 		if fields[0] == "pswpin" {
 			in = v
-		}
-		if fields[0] == "pswpout" {
+		} else if fields[0] == "pswpout" {
 			out = v
 		}
 	}
@@ -207,12 +216,12 @@ func (c *Collector) readCPU() (uint64, uint64, error) {
 	}
 
 	lines := strings.Split(string(data), "\n")
-	if len(lines) == 0 {
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
 		return 0, 0, errors.New("invalid cpu")
 	}
 
 	fields := strings.Fields(lines[0])
-	if len(fields) < 5 {
+	if len(fields) < 5 || fields[0] != "cpu" {
 		return 0, 0, errors.New("invalid cpu")
 	}
 
@@ -222,7 +231,7 @@ func (c *Collector) readCPU() (uint64, uint64, error) {
 	for i, s := range fields[1:] {
 		v, err := strconv.ParseUint(s, 10, 64)
 		if err != nil {
-			continue
+			return 0, 0, errors.New("invalid cpu values")
 		}
 		total += v
 		if i == 3 || i == 4 {
@@ -249,8 +258,11 @@ func (c *Collector) readDiskStats() (uint64, uint64, error) {
 		if strings.HasPrefix(dev, "loop") || strings.HasPrefix(dev, "ram") {
 			continue
 		}
-		ri, _ := strconv.ParseUint(fields[3], 10, 64)
-		wi, _ := strconv.ParseUint(fields[7], 10, 64)
+		ri, err1 := strconv.ParseUint(fields[3], 10, 64)
+		wi, err2 := strconv.ParseUint(fields[7], 10, 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
 		r += ri
 		w += wi
 	}
@@ -264,9 +276,13 @@ func (c *Collector) readNetDev() (uint64, uint64, error) {
 		return 0, 0, err
 	}
 
+	lines := strings.Split(string(data), "\n")
+	if len(lines) < 3 {
+		return 0, 0, errors.New("invalid /proc/net/dev")
+	}
+
 	var rx, tx uint64
-	lines := strings.Split(string(data), "\n")[2:]
-	for _, line := range lines {
+	for _, line := range lines[2:] {
 		if !strings.Contains(line, ":") {
 			continue
 		}
@@ -279,8 +295,11 @@ func (c *Collector) readNetDev() (uint64, uint64, error) {
 		if len(fields) < 9 {
 			continue
 		}
-		rxv, _ := strconv.ParseUint(fields[0], 10, 64)
-		txv, _ := strconv.ParseUint(fields[8], 10, 64)
+		rxv, err1 := strconv.ParseUint(fields[0], 10, 64)
+		txv, err2 := strconv.ParseUint(fields[8], 10, 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
 		rx += rxv
 		tx += txv
 	}
@@ -296,6 +315,7 @@ func (d DeltaCalculator) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnap
 
 	out := DerivedSnapshot{
 		Timestamp:       curr.Timestamp,
+		TimestampUnix:   curr.Timestamp.Unix(),
 		Host:            curr.Host,
 		Load1:           curr.Load1,
 		Load5:           curr.Load5,
@@ -333,17 +353,19 @@ func (d DeltaCalculator) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnap
 	out.RXRateBPS = delta(prev.RXBytesTotal, curr.RXBytesTotal, elapsed)
 	out.TXRateBPS = delta(prev.TXBytesTotal, curr.TXBytesTotal, elapsed)
 
-	totalDelta := curr.CPUTotal - prev.CPUTotal
-	idleDelta := curr.CPUIDleTotal - prev.CPUIDleTotal
-	if totalDelta > 0 {
-		v := 100.0 * (1.0 - float64(idleDelta)/float64(totalDelta))
-		if v < 0 {
-			v = 0
+	if curr.CPUTotal >= prev.CPUTotal && curr.CPUIDleTotal >= prev.CPUIDleTotal {
+		totalDelta := curr.CPUTotal - prev.CPUTotal
+		idleDelta := curr.CPUIDleTotal - prev.CPUIDleTotal
+		if totalDelta > 0 {
+			v := 100.0 * (1.0 - float64(idleDelta)/float64(totalDelta))
+			if v < 0 {
+				v = 0
+			}
+			if v > 100 {
+				v = 100
+			}
+			out.CPUUsagePercent = &v
 		}
-		if v > 100 {
-			v = 100
-		}
-		out.CPUUsagePercent = &v
 	}
 
 	return out
@@ -370,106 +392,232 @@ func percent(v, total uint64) float64 {
 	return float64(v) / float64(total) * 100
 }
 
-func main() {
-	interval := 0.0
-	count := 0
-	framed := false
-	jsonMode := false
-	csvPath := ""
-
-	parseArgs(os.Args[1:], &interval, &count, &framed, &jsonMode, &csvPath)
-
-	collector := NewCollector()
-	calc := DeltaCalculator{}
-
-	var prev *RawSnapshot
-
-	if csvPath != "" {
-		os.MkdirAll(filepath.Dir(csvPath), 0755)
-		f, err := os.OpenFile(csvPath, os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			w := csv.NewWriter(f)
-			w.Write([]string{"timestamp", "host", "cpu", "load1", "mem%", "swap%"})
-			w.Flush()
-			f.Close()
-		}
+func sleepInterruptible(d time.Duration, stop <-chan struct{}) bool {
+	if d <= 0 {
+		return true
 	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 
-	sig := make(chan os.Signal, 1)
-	done := make(chan struct{})
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		close(done)
-	}()
-
-	i := 0
-
-	if interval <= 0 {
-		first, err := collector.Collect()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
-		second, err := collector.Collect()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		derived := calc.Derive(&first, second)
-		output(derived, framed, jsonMode)
-		if csvPath != "" {
-			appendCSV(csvPath, derived)
-		}
-		return
-	}
-
-	for {
-		select {
-		case <-done:
-			return
-		default:
-		}
-
-		curr, err := collector.Collect()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		derived := calc.Derive(prev, curr)
-
-		output(derived, framed, jsonMode)
-
-		if csvPath != "" {
-			appendCSV(csvPath, derived)
-		}
-
-		prev = &curr
-
-		i++
-		if count > 0 && i >= count {
-			break
-		}
-
-		time.Sleep(time.Duration(interval * float64(time.Second)))
+	select {
+	case <-timer.C:
+		return true
+	case <-stop:
+		return false
 	}
 }
 
-func output(d DerivedSnapshot, framed bool, jsonMode bool) {
+func ensureCSV(path string) error {
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+
+	needsHeader := false
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			needsHeader = true
+		} else {
+			return err
+		}
+	} else if info.Size() == 0 {
+		needsHeader = true
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if needsHeader {
+		w := csv.NewWriter(f)
+		err = w.Write([]string{
+			"timestamp_unix",
+			"timestamp_iso",
+			"host",
+			"elapsed_seconds",
+			"cpu_usage_percent",
+			"load1",
+			"load5",
+			"load15",
+			"mem_total_bytes",
+			"mem_available_bytes",
+			"mem_used_bytes",
+			"mem_used_percent",
+			"swap_total_bytes",
+			"swap_free_bytes",
+			"swap_used_bytes",
+			"swap_used_percent",
+			"pswpin_total",
+			"pswpout_total",
+			"swapin_rate_per_s",
+			"swapout_rate_per_s",
+			"read_ios_total",
+			"write_ios_total",
+			"read_iops",
+			"write_iops",
+			"rx_bytes_total",
+			"tx_bytes_total",
+			"rx_rate_Bps",
+			"tx_rate_Bps",
+		})
+		if err != nil {
+			return err
+		}
+		w.Flush()
+		if err := w.Error(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func appendCSV(path string, d DerivedSnapshot) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	cpu := ""
+	if d.CPUUsagePercent != nil {
+		cpu = fmt.Sprintf("%.6f", *d.CPUUsagePercent)
+	}
+
+	w := csv.NewWriter(f)
+	err = w.Write([]string{
+		strconv.FormatInt(d.TimestampUnix, 10),
+		d.Timestamp.Format(time.RFC3339),
+		d.Host,
+		fmt.Sprintf("%.6f", d.ElapsedSeconds),
+		cpu,
+		fmt.Sprintf("%.6f", d.Load1),
+		fmt.Sprintf("%.6f", d.Load5),
+		fmt.Sprintf("%.6f", d.Load15),
+		strconv.FormatUint(d.MemTotalBytes, 10),
+		strconv.FormatUint(d.MemAvailable, 10),
+		strconv.FormatUint(d.MemUsedBytes, 10),
+		fmt.Sprintf("%.6f", d.MemUsedPercent),
+		strconv.FormatUint(d.SwapTotalBytes, 10),
+		strconv.FormatUint(d.SwapFreeBytes, 10),
+		strconv.FormatUint(d.SwapUsedBytes, 10),
+		fmt.Sprintf("%.6f", d.SwapUsedPercent),
+		strconv.FormatUint(d.PSwpInTotal, 10),
+		strconv.FormatUint(d.PSwpOutTotal, 10),
+		fmt.Sprintf("%.6f", d.SwapInRate),
+		fmt.Sprintf("%.6f", d.SwapOutRate),
+		strconv.FormatUint(d.ReadIOsTotal, 10),
+		strconv.FormatUint(d.WriteIOsTotal, 10),
+		fmt.Sprintf("%.6f", d.ReadIOPS),
+		fmt.Sprintf("%.6f", d.WriteIOPS),
+		strconv.FormatUint(d.RXBytesTotal, 10),
+		strconv.FormatUint(d.TXBytesTotal, 10),
+		fmt.Sprintf("%.6f", d.RXRateBPS),
+		fmt.Sprintf("%.6f", d.TXRateBPS),
+	})
+	if err != nil {
+		return err
+	}
+	w.Flush()
+	return w.Error()
+}
+
+func usage() string {
+	return strings.TrimSpace(`
+usage: perfdelta [options]
+
+options:
+  -i, --interval <seconds>   sample interval, non-negative float
+  -c, --count <n>            number of emitted samples in interval mode
+  --warmup-ms <ms>           warmup delay for single-shot mode
+  --framed                   framed terminal output
+  --json                     JSON output
+  --csv <path>               append CSV output
+`)
+}
+
+func parseArgs(args []string) (Config, error) {
+	cfg := Config{
+		Interval: 0,
+		Count:    0,
+		Framed:   false,
+		JSON:     false,
+		CSVPath:  "",
+		WarmupMS: 250,
+	}
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h", "--help":
+			return cfg, errors.New(usage())
+		case "-i", "--interval":
+			if i+1 >= len(args) {
+				return cfg, errors.New("missing value for interval")
+			}
+			v, err := strconv.ParseFloat(args[i+1], 64)
+			if err != nil || v < 0 {
+				return cfg, errors.New("interval must be a non-negative number")
+			}
+			cfg.Interval = v
+			i++
+		case "-c", "--count":
+			if i+1 >= len(args) {
+				return cfg, errors.New("missing value for count")
+			}
+			v, err := strconv.Atoi(args[i+1])
+			if err != nil || v < 0 {
+				return cfg, errors.New("count must be a non-negative integer")
+			}
+			cfg.Count = v
+			i++
+		case "--warmup-ms":
+			if i+1 >= len(args) {
+				return cfg, errors.New("missing value for warmup-ms")
+			}
+			v, err := strconv.Atoi(args[i+1])
+			if err != nil || v < 0 {
+				return cfg, errors.New("warmup-ms must be a non-negative integer")
+			}
+			cfg.WarmupMS = v
+			i++
+		case "--framed":
+			cfg.Framed = true
+		case "--json":
+			cfg.JSON = true
+		case "--csv":
+			if i+1 >= len(args) {
+				return cfg, errors.New("missing value for csv")
+			}
+			cfg.CSVPath = args[i+1]
+			i++
+		default:
+			return cfg, fmt.Errorf("unknown argument: %s", args[i])
+		}
+	}
+
+	return cfg, nil
+}
+
+func output(d DerivedSnapshot, framed bool, jsonMode bool) error {
 	if jsonMode {
 		b, err := json.MarshalIndent(d, "", "  ")
-		if err == nil {
-			fmt.Println(string(b))
+		if err != nil {
+			return err
 		}
-		return
+		fmt.Println(string(b))
+		return nil
 	}
 	if framed {
 		printFramed(d)
-		return
+		return nil
 	}
 	fmt.Println(formatLine(d))
+	return nil
 }
 
 func formatLine(d DerivedSnapshot) string {
@@ -477,77 +625,197 @@ func formatLine(d DerivedSnapshot) string {
 	if d.CPUUsagePercent != nil {
 		cpu = fmt.Sprintf("%.2f%%", *d.CPUUsagePercent)
 	}
-	return fmt.Sprintf("%d %s cpu=%s load=%.2f/%.2f/%.2f mem=%.1f%% swap=%.1f%%",
-		d.Timestamp.Unix(),
+	return fmt.Sprintf(
+		"%d %s elapsed=%.3fs cpu=%s load=%.2f/%.2f/%.2f mem=%.1f%% swap=%.1f%% swap_delta=%.2f/%.2f disk_delta=%.2f/%.2f net_delta=%.2f/%.2f",
+		d.TimestampUnix,
 		d.Host,
+		d.ElapsedSeconds,
 		cpu,
 		d.Load1,
 		d.Load5,
 		d.Load15,
 		d.MemUsedPercent,
 		d.SwapUsedPercent,
+		d.SwapInRate,
+		d.SwapOutRate,
+		d.ReadIOPS,
+		d.WriteIOPS,
+		d.RXRateBPS,
+		d.TXRateBPS,
 	)
 }
 
 func printFramed(d DerivedSnapshot) {
-	fmt.Println("==========")
-	fmt.Println(formatLine(d))
-	fmt.Println("==========")
+	lines := []string{
+		fmt.Sprintf("PERF-CHECK DELTA  host=%s  ts=%d  elapsed=%.3fs", d.Host, d.TimestampUnix, d.ElapsedSeconds),
+		fmt.Sprintf("CPU  usage=%s    LOAD  %.2f/%.2f/%.2f", cpuText(d.CPUUsagePercent), d.Load1, d.Load5, d.Load15),
+		fmt.Sprintf("MEM  used=%s (%.1f%%)    available=%s    total=%s", fmtBytes(d.MemUsedBytes), d.MemUsedPercent, fmtBytes(d.MemAvailable), fmtBytes(d.MemTotalBytes)),
+		fmt.Sprintf("SWAP used=%s (%.1f%%)    free=%s    total=%s", fmtBytes(d.SwapUsedBytes), d.SwapUsedPercent, fmtBytes(d.SwapFreeBytes), fmtBytes(d.SwapTotalBytes)),
+		fmt.Sprintf("SWAP Δ in=%s    out=%s    totals=%d/%d", fmtOps(d.SwapInRate), fmtOps(d.SwapOutRate), d.PSwpInTotal, d.PSwpOutTotal),
+		fmt.Sprintf("DISK Δ read=%s    write=%s    totals=%d/%d", fmtOps(d.ReadIOPS), fmtOps(d.WriteIOPS), d.ReadIOsTotal, d.WriteIOsTotal),
+		fmt.Sprintf("NET  Δ rx=%s    tx=%s    totals=%d/%d", fmtRate(d.RXRateBPS), fmtRate(d.TXRateBPS), d.RXBytesTotal, d.TXBytesTotal),
+	}
+
+	width := 60
+	for _, line := range lines {
+		if len(line)+4 > width {
+			width = len(line) + 4
+		}
+	}
+
+	fmt.Println("┌" + strings.Repeat("─", width-2) + "┐")
+	for i, line := range lines {
+		fmt.Printf("│ %-*s │\n", width-4, line)
+		if i == 0 {
+			fmt.Println("├" + strings.Repeat("─", width-2) + "┤")
+		}
+	}
+	fmt.Println("└" + strings.Repeat("─", width-2) + "┘")
 }
 
-func appendCSV(path string, d DerivedSnapshot) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+func cpuText(v *float64) string {
+	if v == nil {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.2f%%", *v)
+}
+
+func fmtBytes(value uint64) string {
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB"}
+	v := float64(value)
+	idx := 0
+	for v >= 1024 && idx < len(units)-1 {
+		v /= 1024
+		idx++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[idx])
+}
+
+func fmtRate(value float64) string {
+	units := []string{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s", "PiB/s"}
+	v := value
+	idx := 0
+	for v >= 1024 && idx < len(units)-1 {
+		v /= 1024
+		idx++
+	}
+	return fmt.Sprintf("%.2f %s", v, units[idx])
+}
+
+func fmtOps(value float64) string {
+	if value >= 1_000_000_000 {
+		return fmt.Sprintf("%.2f G/s", value/1_000_000_000)
+	}
+	if value >= 1_000_000 {
+		return fmt.Sprintf("%.2f M/s", value/1_000_000)
+	}
+	if value >= 1_000 {
+		return fmt.Sprintf("%.2f K/s", value/1_000)
+	}
+	return fmt.Sprintf("%.2f /s", value)
+}
+
+func main() {
+	cfg, err := parseArgs(os.Args[1:])
 	if err != nil {
+		msg := err.Error()
+		if strings.HasPrefix(msg, "usage:") {
+			fmt.Println(msg)
+			os.Exit(0)
+		}
+		fmt.Fprintln(os.Stderr, msg)
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, usage())
+		os.Exit(1)
+	}
+
+	if cfg.CSVPath != "" {
+		if err := ensureCSV(cfg.CSVPath); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+
+	collector := NewCollector()
+	calc := DeltaCalculator{}
+
+	stop := make(chan struct{})
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sig
+		close(stop)
+	}()
+
+	if cfg.Interval <= 0 {
+		first, err := collector.Collect()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		if !sleepInterruptible(time.Duration(cfg.WarmupMS)*time.Millisecond, stop) {
+			return
+		}
+
+		second, err := collector.Collect()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		derived := calc.Derive(&first, second)
+		if err := output(derived, cfg.Framed, cfg.JSON); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if cfg.CSVPath != "" {
+			if err := appendCSV(cfg.CSVPath, derived); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
 		return
 	}
-	defer f.Close()
 
-	w := csv.NewWriter(f)
+	var prev *RawSnapshot
+	emitted := 0
 
-	cpu := ""
-	if d.CPUUsagePercent != nil {
-		cpu = fmt.Sprintf("%.2f", *d.CPUUsagePercent)
-	}
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
 
-	w.Write([]string{
-		strconv.FormatInt(d.Timestamp.Unix(), 10),
-		d.Host,
-		cpu,
-		fmt.Sprintf("%.2f", d.Load1),
-		fmt.Sprintf("%.2f", d.MemUsedPercent),
-		fmt.Sprintf("%.2f", d.SwapUsedPercent),
-	})
-	w.Flush()
-}
+		curr, err := collector.Collect()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 
-func parseArgs(args []string, interval *float64, count *int, framed *bool, jsonMode *bool, csvPath *string) {
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-i", "--interval":
-			if i+1 < len(args) {
-				v, err := strconv.ParseFloat(args[i+1], 64)
-				if err == nil && v >= 0 {
-					*interval = v
-				}
-				i++
+		derived := calc.Derive(prev, curr)
+		if err := output(derived, cfg.Framed, cfg.JSON); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if cfg.CSVPath != "" {
+			if err := appendCSV(cfg.CSVPath, derived); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
 			}
-		case "-c", "--count":
-			if i+1 < len(args) {
-				v, err := strconv.Atoi(args[i+1])
-				if err == nil && v >= 0 {
-					*count = v
-				}
-				i++
-			}
-		case "--framed":
-			*framed = true
-		case "--json":
-			*jsonMode = true
-		case "--csv":
-			if i+1 < len(args) {
-				*csvPath = args[i+1]
-				i++
-			}
+		}
+
+		prev = &curr
+		emitted++
+
+		if cfg.Count > 0 && emitted >= cfg.Count {
+			break
+		}
+
+		if !sleepInterruptible(time.Duration(cfg.Interval*float64(time.Second)), stop) {
+			return
 		}
 	}
 }
