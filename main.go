@@ -137,9 +137,12 @@ func (c *Collector) readLoad() (float64, float64, float64, error) {
 	if len(fields) < 3 {
 		return 0, 0, 0, errors.New("invalid loadavg")
 	}
-	l1, _ := strconv.ParseFloat(fields[0], 64)
-	l5, _ := strconv.ParseFloat(fields[1], 64)
-	l15, _ := strconv.ParseFloat(fields[2], 64)
+	l1, err1 := strconv.ParseFloat(fields[0], 64)
+	l5, err2 := strconv.ParseFloat(fields[1], 64)
+	l15, err3 := strconv.ParseFloat(fields[2], 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return 0, 0, 0, errors.New("invalid load values")
+	}
 	return l1, l5, l15, nil
 }
 
@@ -203,7 +206,12 @@ func (c *Collector) readCPU() (uint64, uint64, error) {
 		return 0, 0, err
 	}
 
-	fields := strings.Fields(strings.Split(string(data), "\n")[0])
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 {
+		return 0, 0, errors.New("invalid cpu")
+	}
+
+	fields := strings.Fields(lines[0])
 	if len(fields) < 5 {
 		return 0, 0, errors.New("invalid cpu")
 	}
@@ -217,10 +225,7 @@ func (c *Collector) readCPU() (uint64, uint64, error) {
 			continue
 		}
 		total += v
-		if i == 3 {
-			idle += v
-		}
-		if i == 4 {
+		if i == 3 || i == 4 {
 			idle += v
 		}
 	}
@@ -286,8 +291,8 @@ func (c *Collector) readNetDev() (uint64, uint64, error) {
 type DeltaCalculator struct{}
 
 func (d DeltaCalculator) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnapshot {
-	memUsed := curr.MemTotalBytes - curr.MemAvailableBytes
-	swapUsed := curr.SwapTotalBytes - curr.SwapFreeBytes
+	memUsed := clampSub(curr.MemTotalBytes, curr.MemAvailableBytes)
+	swapUsed := clampSub(curr.SwapTotalBytes, curr.SwapFreeBytes)
 
 	out := DerivedSnapshot{
 		Timestamp:       curr.Timestamp,
@@ -332,10 +337,23 @@ func (d DeltaCalculator) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnap
 	idleDelta := curr.CPUIDleTotal - prev.CPUIDleTotal
 	if totalDelta > 0 {
 		v := 100.0 * (1.0 - float64(idleDelta)/float64(totalDelta))
+		if v < 0 {
+			v = 0
+		}
+		if v > 100 {
+			v = 100
+		}
 		out.CPUUsagePercent = &v
 	}
 
 	return out
+}
+
+func clampSub(a, b uint64) uint64 {
+	if a < b {
+		return 0
+	}
+	return a - b
 }
 
 func delta(prev, curr uint64, elapsed float64) float64 {
@@ -368,19 +386,52 @@ func main() {
 
 	if csvPath != "" {
 		os.MkdirAll(filepath.Dir(csvPath), 0755)
-		f, _ := os.OpenFile(csvPath, os.O_CREATE, 0644)
-		f.Close()
+		f, err := os.OpenFile(csvPath, os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			w := csv.NewWriter(f)
+			w.Write([]string{"timestamp", "host", "cpu", "load1", "mem%", "swap%"})
+			w.Flush()
+			f.Close()
+		}
 	}
 
 	sig := make(chan os.Signal, 1)
+	done := make(chan struct{})
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		os.Exit(0)
+		close(done)
 	}()
 
 	i := 0
+
+	if interval <= 0 {
+		first, err := collector.Collect()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+		second, err := collector.Collect()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		derived := calc.Derive(&first, second)
+		output(derived, framed, jsonMode)
+		if csvPath != "" {
+			appendCSV(csvPath, derived)
+		}
+		return
+	}
+
 	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
 		curr, err := collector.Collect()
 		if err != nil {
 			fmt.Println(err)
@@ -389,24 +440,13 @@ func main() {
 
 		derived := calc.Derive(prev, curr)
 
-		if jsonMode {
-			b, _ := json.MarshalIndent(derived, "", "  ")
-			fmt.Println(string(b))
-		} else if framed {
-			printFramed(derived)
-		} else {
-			fmt.Println(formatLine(derived))
-		}
+		output(derived, framed, jsonMode)
 
 		if csvPath != "" {
 			appendCSV(csvPath, derived)
 		}
 
 		prev = &curr
-
-		if interval <= 0 {
-			break
-		}
 
 		i++
 		if count > 0 && i >= count {
@@ -415,6 +455,21 @@ func main() {
 
 		time.Sleep(time.Duration(interval * float64(time.Second)))
 	}
+}
+
+func output(d DerivedSnapshot, framed bool, jsonMode bool) {
+	if jsonMode {
+		b, err := json.MarshalIndent(d, "", "  ")
+		if err == nil {
+			fmt.Println(string(b))
+		}
+		return
+	}
+	if framed {
+		printFramed(d)
+		return
+	}
+	fmt.Println(formatLine(d))
 }
 
 func formatLine(d DerivedSnapshot) string {
@@ -448,11 +503,19 @@ func appendCSV(path string, d DerivedSnapshot) {
 	defer f.Close()
 
 	w := csv.NewWriter(f)
+
+	cpu := ""
+	if d.CPUUsagePercent != nil {
+		cpu = fmt.Sprintf("%.2f", *d.CPUUsagePercent)
+	}
+
 	w.Write([]string{
 		strconv.FormatInt(d.Timestamp.Unix(), 10),
 		d.Host,
+		cpu,
 		fmt.Sprintf("%.2f", d.Load1),
 		fmt.Sprintf("%.2f", d.MemUsedPercent),
+		fmt.Sprintf("%.2f", d.SwapUsedPercent),
 	})
 	w.Flush()
 }
@@ -462,14 +525,18 @@ func parseArgs(args []string, interval *float64, count *int, framed *bool, jsonM
 		switch args[i] {
 		case "-i", "--interval":
 			if i+1 < len(args) {
-				v, _ := strconv.ParseFloat(args[i+1], 64)
-				*interval = v
+				v, err := strconv.ParseFloat(args[i+1], 64)
+				if err == nil && v >= 0 {
+					*interval = v
+				}
 				i++
 			}
 		case "-c", "--count":
 			if i+1 < len(args) {
-				v, _ := strconv.Atoi(args[i+1])
-				*count = v
+				v, err := strconv.Atoi(args[i+1])
+				if err == nil && v >= 0 {
+					*count = v
+				}
 				i++
 			}
 		case "--framed":
