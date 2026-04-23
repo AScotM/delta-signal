@@ -96,9 +96,9 @@ type Config struct {
 }
 
 type CSVWriter struct {
-	mu sync.Mutex
-	path string
-	file *os.File
+	mu     sync.Mutex
+	path   string
+	file   *os.File
 	writer *csv.Writer
 }
 
@@ -172,8 +172,8 @@ func NewCSVWriter(path string) (*CSVWriter, error) {
 	}
 
 	return &CSVWriter{
-		path: path,
-		file: f,
+		path:   path,
+		file:   f,
 		writer: w,
 	}, nil
 }
@@ -227,6 +227,7 @@ func (cw *CSVWriter) Append(d DerivedSnapshot) error {
 func (cw *CSVWriter) Close() error {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
+
 	if cw.writer != nil {
 		cw.writer.Flush()
 	}
@@ -572,7 +573,11 @@ func delta(prev, curr uint64, elapsed float64) float64 {
 	if curr < prev || elapsed <= 0 {
 		return 0
 	}
-	return float64(curr-prev) / elapsed
+	diff := float64(curr - prev)
+	if diff < 0 || elapsed < 0.000001 {
+		return 0
+	}
+	return diff / elapsed
 }
 
 func percent(v, total uint64) float64 {
@@ -787,6 +792,10 @@ func main() {
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, usage())
 		os.Exit(1)
+	}
+
+	if cfg.Interval > 0 && cfg.Count == 0 {
+		fmt.Fprintln(os.Stderr, "warning: no count specified, running indefinitely")
 	}
 
 	var csvWriter *CSVWriter
