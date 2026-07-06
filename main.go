@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,8 @@ import (
 	"syscall"
 	"time"
 )
+
+const version = "1.0.0"
 
 type RawSnapshot struct {
 	Timestamp         time.Time `json:"timestamp"`
@@ -44,6 +48,9 @@ func (r RawSnapshot) Validate() error {
 	}
 	if r.MemTotalBytes == 0 && r.SwapTotalBytes == 0 {
 		return errors.New("both mem and swap total are zero")
+	}
+	if r.CPUTotal == 0 {
+		return errors.New("cpu total is zero")
 	}
 	return nil
 }
@@ -103,10 +110,14 @@ type CSVWriter struct {
 }
 
 func NewCSVWriter(path string) (*CSVWriter, error) {
+	if path == "" {
+		return nil, errors.New("csv path cannot be empty")
+	}
+
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create csv directory: %w", err)
 		}
 	}
 
@@ -116,7 +127,7 @@ func NewCSVWriter(path string) (*CSVWriter, error) {
 		if os.IsNotExist(err) {
 			needsHeader = true
 		} else {
-			return nil, err
+			return nil, fmt.Errorf("failed to stat csv file: %w", err)
 		}
 	} else if info.Size() == 0 {
 		needsHeader = true
@@ -124,7 +135,7 @@ func NewCSVWriter(path string) (*CSVWriter, error) {
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open csv file: %w", err)
 	}
 
 	w := csv.NewWriter(f)
@@ -162,12 +173,12 @@ func NewCSVWriter(path string) (*CSVWriter, error) {
 		})
 		if err != nil {
 			f.Close()
-			return nil, err
+			return nil, fmt.Errorf("failed to write csv header: %w", err)
 		}
 		w.Flush()
 		if err := w.Error(); err != nil {
 			f.Close()
-			return nil, err
+			return nil, fmt.Errorf("failed to flush csv header: %w", err)
 		}
 	}
 
@@ -218,10 +229,13 @@ func (cw *CSVWriter) Append(d DerivedSnapshot) error {
 		fmt.Sprintf("%.6f", d.TXRateBPS),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to write csv record: %w", err)
 	}
 	cw.writer.Flush()
-	return cw.writer.Error()
+	if err := cw.writer.Error(); err != nil {
+		return fmt.Errorf("failed to flush csv writer: %w", err)
+	}
+	return nil
 }
 
 func (cw *CSVWriter) Close() error {
@@ -230,9 +244,14 @@ func (cw *CSVWriter) Close() error {
 
 	if cw.writer != nil {
 		cw.writer.Flush()
+		if err := cw.writer.Error(); err != nil {
+			return fmt.Errorf("failed to flush csv writer on close: %w", err)
+		}
 	}
 	if cw.file != nil {
-		return cw.file.Close()
+		if err := cw.file.Close(); err != nil {
+			return fmt.Errorf("failed to close csv file: %w", err)
+		}
 	}
 	return nil
 }
@@ -252,32 +271,32 @@ func NewCollector() *Collector {
 func (c *Collector) Collect() (RawSnapshot, error) {
 	load1, load5, load15, err := c.readLoad()
 	if err != nil {
-		return RawSnapshot{}, err
+		return RawSnapshot{}, fmt.Errorf("failed to read load: %w", err)
 	}
 
 	memTotal, memAvail, swapTotal, swapFree, err := c.readMemInfo()
 	if err != nil {
-		return RawSnapshot{}, err
+		return RawSnapshot{}, fmt.Errorf("failed to read meminfo: %w", err)
 	}
 
 	pswpIn, pswpOut, err := c.readVMStat()
 	if err != nil {
-		return RawSnapshot{}, err
+		return RawSnapshot{}, fmt.Errorf("failed to read vmstat: %w", err)
 	}
 
 	cpuIdle, cpuTotal, err := c.readCPU()
 	if err != nil {
-		return RawSnapshot{}, err
+		return RawSnapshot{}, fmt.Errorf("failed to read cpu: %w", err)
 	}
 
 	readIOs, writeIOs, err := c.readDiskStats()
 	if err != nil {
-		return RawSnapshot{}, err
+		return RawSnapshot{}, fmt.Errorf("failed to read diskstats: %w", err)
 	}
 
 	rxBytes, txBytes, err := c.readNetDev()
 	if err != nil {
-		return RawSnapshot{}, err
+		return RawSnapshot{}, fmt.Errorf("failed to read netdev: %w", err)
 	}
 
 	snapshot := RawSnapshot{
@@ -307,15 +326,38 @@ func (c *Collector) Collect() (RawSnapshot, error) {
 	return snapshot, nil
 }
 
+func (c *Collector) readFileLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
+}
+
 func (c *Collector) readLoad() (float64, float64, float64, error) {
-	data, err := os.ReadFile("/proc/loadavg")
+	lines, err := c.readFileLines("/proc/loadavg")
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 3 {
-		return 0, 0, 0, errors.New("invalid loadavg")
+	if len(lines) == 0 {
+		return 0, 0, 0, errors.New("empty loadavg")
 	}
+
+	fields := strings.Fields(lines[0])
+	if len(fields) < 3 {
+		return 0, 0, 0, errors.New("invalid loadavg format")
+	}
+
 	l1, err1 := strconv.ParseFloat(fields[0], 64)
 	l5, err2 := strconv.ParseFloat(fields[1], 64)
 	l15, err3 := strconv.ParseFloat(fields[2], 64)
@@ -326,13 +368,13 @@ func (c *Collector) readLoad() (float64, float64, float64, error) {
 }
 
 func (c *Collector) readMemInfo() (uint64, uint64, uint64, uint64, error) {
-	data, err := os.ReadFile("/proc/meminfo")
+	lines, err := c.readFileLines("/proc/meminfo")
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
 
 	values := map[string]uint64{}
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range lines {
 		if !strings.Contains(line, ":") {
 			continue
 		}
@@ -349,17 +391,23 @@ func (c *Collector) readMemInfo() (uint64, uint64, uint64, uint64, error) {
 		values[key] = v * 1024
 	}
 
-	return values["MemTotal"], values["MemAvailable"], values["SwapTotal"], values["SwapFree"], nil
+	memTotal := values["MemTotal"]
+	memAvail := values["MemAvailable"]
+	if memAvail == 0 {
+		memAvail = values["MemFree"]
+	}
+
+	return memTotal, memAvail, values["SwapTotal"], values["SwapFree"], nil
 }
 
 func (c *Collector) readVMStat() (uint64, uint64, error) {
-	data, err := os.ReadFile("/proc/vmstat")
+	lines, err := c.readFileLines("/proc/vmstat")
 	if err != nil {
 		return 0, 0, err
 	}
 
 	var in, out uint64
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
@@ -368,9 +416,10 @@ func (c *Collector) readVMStat() (uint64, uint64, error) {
 		if err != nil {
 			continue
 		}
-		if fields[0] == "pswpin" {
+		switch fields[0] {
+		case "pswpin":
 			in = v
-		} else if fields[0] == "pswpout" {
+		case "pswpout":
 			out = v
 		}
 	}
@@ -392,19 +441,17 @@ const (
 )
 
 func (c *Collector) readCPU() (uint64, uint64, error) {
-	data, err := os.ReadFile("/proc/stat")
+	lines, err := c.readFileLines("/proc/stat")
 	if err != nil {
 		return 0, 0, err
 	}
-
-	lines := strings.Split(string(data), "\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
-		return 0, 0, errors.New("invalid cpu")
+		return 0, 0, errors.New("invalid cpu stat")
 	}
 
 	fields := strings.Fields(lines[0])
 	if len(fields) < 5 || fields[0] != "cpu" {
-		return 0, 0, errors.New("invalid cpu")
+		return 0, 0, errors.New("invalid cpu format")
 	}
 
 	var total uint64
@@ -413,13 +460,10 @@ func (c *Collector) readCPU() (uint64, uint64, error) {
 	for i, s := range fields[1:] {
 		v, err := strconv.ParseUint(s, 10, 64)
 		if err != nil {
-			return 0, 0, errors.New("invalid cpu values")
+			return 0, 0, fmt.Errorf("invalid cpu value: %w", err)
 		}
 		total += v
 		if i == cpuFieldIdle {
-			idle += v
-		}
-		if i == cpuFieldIowait {
 			idle += v
 		}
 	}
@@ -432,13 +476,13 @@ func (c *Collector) readCPU() (uint64, uint64, error) {
 }
 
 func (c *Collector) readDiskStats() (uint64, uint64, error) {
-	data, err := os.ReadFile("/proc/diskstats")
+	lines, err := c.readFileLines("/proc/diskstats")
 	if err != nil {
 		return 0, 0, err
 	}
 
 	var r, w uint64
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) < 14 {
 			continue
@@ -460,12 +504,10 @@ func (c *Collector) readDiskStats() (uint64, uint64, error) {
 }
 
 func (c *Collector) readNetDev() (uint64, uint64, error) {
-	data, err := os.ReadFile("/proc/net/dev")
+	lines, err := c.readFileLines("/proc/net/dev")
 	if err != nil {
 		return 0, 0, err
 	}
-
-	lines := strings.Split(string(data), "\n")
 	if len(lines) < 3 {
 		return 0, 0, errors.New("invalid /proc/net/dev")
 	}
@@ -587,7 +629,7 @@ func percent(v, total uint64) float64 {
 	return float64(v) / float64(total) * 100
 }
 
-func sleepInterruptible(d time.Duration, stop <-chan struct{}) bool {
+func sleepInterruptible(d time.Duration, ctx context.Context) bool {
 	if d <= 0 {
 		return true
 	}
@@ -597,7 +639,7 @@ func sleepInterruptible(d time.Duration, stop <-chan struct{}) bool {
 	select {
 	case <-timer.C:
 		return true
-	case <-stop:
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -613,6 +655,8 @@ options:
   --framed                   framed terminal output
   --json                     JSON output
   --csv <path>               append CSV output
+  --version                  show version
+  -h, --help                 show this help
 `)
 }
 
@@ -630,6 +674,8 @@ func parseArgs(args []string) (Config, error) {
 		switch args[i] {
 		case "-h", "--help":
 			return cfg, errors.New(usage())
+		case "--version":
+			return cfg, fmt.Errorf("perfdelta version %s", version)
 		case "-i", "--interval":
 			if i+1 >= len(args) {
 				return cfg, errors.New("missing value for interval")
@@ -682,7 +728,7 @@ func output(d DerivedSnapshot, framed bool, jsonMode bool) error {
 	if jsonMode {
 		b, err := json.MarshalIndent(d, "", "  ")
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to marshal json: %w", err)
 		}
 		fmt.Println(string(b))
 		return nil
@@ -784,7 +830,7 @@ func main() {
 	cfg, err := parseArgs(os.Args[1:])
 	if err != nil {
 		msg := err.Error()
-		if strings.HasPrefix(msg, "usage:") {
+		if strings.HasPrefix(msg, "usage:") || strings.HasPrefix(msg, "perfdelta version") {
 			fmt.Println(msg)
 			os.Exit(0)
 		}
@@ -805,18 +851,26 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		defer csvWriter.Close()
+		defer func() {
+			if csvWriter != nil {
+				if err := csvWriter.Close(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+				}
+			}
+		}()
 	}
 
 	collector := NewCollector()
 
-	stop := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-sig
-		close(stop)
+		cancel()
 	}()
 
 	if cfg.Interval <= 0 {
@@ -826,7 +880,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		if !sleepInterruptible(time.Duration(cfg.WarmupMS)*time.Millisecond, stop) {
+		if !sleepInterruptible(time.Duration(cfg.WarmupMS)*time.Millisecond, ctx) {
 			return
 		}
 
@@ -855,7 +909,7 @@ func main() {
 
 	for {
 		select {
-		case <-stop:
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -885,7 +939,7 @@ func main() {
 			break
 		}
 
-		if !sleepInterruptible(time.Duration(cfg.Interval*float64(time.Second)), stop) {
+		if !sleepInterruptible(time.Duration(cfg.Interval*float64(time.Second)), ctx) {
 			return
 		}
 	}
