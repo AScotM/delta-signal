@@ -235,6 +235,9 @@ func (cw *CSVWriter) Append(d DerivedSnapshot) error {
 	if err := cw.writer.Error(); err != nil {
 		return fmt.Errorf("failed to flush csv writer: %w", err)
 	}
+	if err := cw.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync csv file: %w", err)
+	}
 	return nil
 }
 
@@ -249,6 +252,9 @@ func (cw *CSVWriter) Close() error {
 		}
 	}
 	if cw.file != nil {
+		if err := cw.file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync csv file on close: %w", err)
+		}
 		if err := cw.file.Close(); err != nil {
 			return fmt.Errorf("failed to close csv file: %w", err)
 		}
@@ -300,7 +306,7 @@ func (c *Collector) Collect() (RawSnapshot, error) {
 	}
 
 	snapshot := RawSnapshot{
-		Timestamp:         time.Now(),
+		Timestamp:         time.Now().UTC(),
 		Host:              c.Hostname,
 		Load1:             load1,
 		Load5:             load5,
@@ -488,7 +494,7 @@ func (c *Collector) readDiskStats() (uint64, uint64, error) {
 			continue
 		}
 		dev := fields[2]
-		if strings.HasPrefix(dev, "loop") || strings.HasPrefix(dev, "ram") {
+		if strings.HasPrefix(dev, "loop") || strings.HasPrefix(dev, "ram") || strings.HasPrefix(dev, "docker") || strings.HasPrefix(dev, "veth") {
 			continue
 		}
 		ri, err1 := strconv.ParseUint(fields[3], 10, 64)
@@ -519,7 +525,7 @@ func (c *Collector) readNetDev() (uint64, uint64, error) {
 		}
 		parts := strings.SplitN(line, ":", 2)
 		iface := strings.TrimSpace(parts[0])
-		if iface == "lo" {
+		if iface == "lo" || strings.HasPrefix(iface, "docker") || strings.HasPrefix(iface, "veth") || strings.HasPrefix(iface, "br-") {
 			continue
 		}
 		fields := strings.Fields(parts[1])
@@ -597,6 +603,12 @@ func (c *Collector) Derive(prev *RawSnapshot, curr RawSnapshot) DerivedSnapshot 
 			if v > 100 {
 				v = 100
 			}
+			out.CPUUsagePercent = &v
+		}
+	} else if curr.CPUTotal >= prev.CPUTotal && curr.CPUIDleTotal < prev.CPUIDleTotal {
+		totalDelta := curr.CPUTotal - prev.CPUTotal
+		if totalDelta > 0 {
+			v := 100.0
 			out.CPUUsagePercent = &v
 		}
 	}
